@@ -1,0 +1,22 @@
+[Unit]
+Description=Massist Event Messaging Service
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User={{ app_user }}
+Group={{ app_user }}
+WorkingDirectory={{ service_dir }}
+Environment=SPRING_RABBITMQ_HOST=localhost
+Environment=SPRING_RABBITMQ_PORT=5672
+Environment=SPRING_RABBITMQ_USERNAME=guest
+Environment=SPRING_RABBITMQ_PASSWORD=guest
+ExecStartPre=/bin/bash -c 'until docker compose -f {{ service_dir }}/docker-compose.yml ps --status running 2>/dev/null | grep -q rabbitmq; do sleep 2; done'
+ExecStart=/usr/bin/java -jar {{ jar_path }}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

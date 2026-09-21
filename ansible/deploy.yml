@@ -1,0 +1,156 @@
+---
+- name: Deploy massist-event-messaging-service on Amazon Linux 2023
+  hosts: massist
+  become: true
+  vars:
+    app_user: ec2-user
+    app_root: /opt/massist
+    service_dir: /opt/massist/massist-event-messaging-service
+    jar_path: /opt/massist/massist-event-messaging-service/target/massist-event-messaging-service-0.0.1-SNAPSHOT.jar
+    compose_plugin_version: "2.32.4"
+
+  tasks:
+    - name: Install Java 21, Git, Docker, and rsync
+      ansible.builtin.dnf:
+        name:
+          - java-21-amazon-corretto
+          - java-21-amazon-corretto-devel
+          - git
+          - docker
+          - rsync
+        state: present
+        update_cache: true
+
+    - name: Install docker-compose-plugin from dnf when available
+      ansible.builtin.dnf:
+        name: docker-compose-plugin
+        state: present
+      failed_when: false
+
+    - name: Enable and start Docker
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Add {{ app_user }} to the docker group
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        groups: docker
+        append: true
+
+    - name: Reset SSH so the docker group is picked up
+      ansible.builtin.meta: reset_connection
+
+    - name: Verify docker compose is available
+      ansible.builtin.command: docker compose version
+      become: false
+      register: compose_version
+      changed_when: false
+      failed_when: false
+
+    - name: Ensure Docker CLI plugins directory exists
+      ansible.builtin.file:
+        path: /usr/libexec/docker/cli-plugins
+        state: directory
+        mode: "0755"
+      when: compose_version.rc != 0
+
+    - name: Download Docker Compose plugin when the CLI plugin is missing
+      ansible.builtin.get_url:
+        url: "https://github.com/docker/compose/releases/download/v{{ compose_plugin_version }}/docker-compose-linux-{{ ansible_architecture }}"
+        dest: /usr/libexec/docker/cli-plugins/docker-compose
+        mode: "0755"
+      when: compose_version.rc != 0
+
+    - name: Re-check docker compose after plugin install
+      ansible.builtin.command: docker compose version
+      become: false
+      register: compose_version
+      changed_when: false
+      failed_when: false
+      when: compose_version.rc != 0
+
+    - name: Fail if docker compose is missing
+      ansible.builtin.fail:
+        msg: >-
+          docker compose is required but was not found. Install docker-compose-plugin
+          or re-run after fixing Docker Compose.
+      when: compose_version.rc != 0
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_root }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+
+    - name: Sync project from the control machine
+      ansible.posix.synchronize:
+        src: "{{ playbook_dir }}/../"
+        dest: "{{ app_root }}/"
+        archive: true
+        compress: true
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=target"
+          - "--exclude=.idea"
+          - "--exclude=ansible/inventory.ini"
+      become: false
+
+    - name: Ensure Maven wrapper is executable
+      ansible.builtin.file:
+        path: "{{ service_dir }}/mvnw"
+        mode: "0755"
+
+    - name: Start RabbitMQ with Docker Compose
+      ansible.builtin.command: docker compose up -d
+      args:
+        chdir: "{{ service_dir }}"
+      become: false
+      register: compose_up
+      changed_when: "'Started' in compose_up.stdout or 'Created' in compose_up.stdout or compose_up.rc == 0"
+
+    - name: Wait for RabbitMQ AMQP port
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 5672
+        delay: 5
+        timeout: 120
+
+    - name: Package the Spring Boot application
+      ansible.builtin.command: ./mvnw -q -DskipTests package
+      args:
+        chdir: "{{ service_dir }}"
+      become: false
+
+    - name: Install systemd unit
+      ansible.builtin.template:
+        src: massist-event-messaging.service.j2
+        dest: /etc/systemd/system/massist-event-messaging.service
+        mode: "0644"
+      notify: Restart massist-event-messaging
+
+    - name: Enable and start massist-event-messaging
+      ansible.builtin.systemd:
+        name: massist-event-messaging
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Wait until the application health endpoint is up
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8080/actuator/health
+        status_code: 200
+      register: health
+      retries: 30
+      delay: 5
+      until: health.status == 200
+
+  handlers:
+    - name: Restart massist-event-messaging
+      ansible.builtin.systemd:
+        name: massist-event-messaging
+        state: restarted
+        daemon_reload: true
